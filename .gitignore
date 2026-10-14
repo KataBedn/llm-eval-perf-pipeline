@@ -1,0 +1,13 @@
+# Environment secrets
+.env
+*.env
+
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+
+# Promptfoo cache and output artifacts
+.promptfoo/
+promptfoo_output.json
+promptfoo_results.json
