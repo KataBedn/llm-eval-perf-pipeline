@@ -1,14 +1,23 @@
 {
   "name": "llm-eval-perf-pipeline",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Evaluation pipeline comparing LLMs as a fintech customer support agent: LLM-as-a-judge, adversarial test cases, latency/cost metrics and a model selection gate.",
+  "private": true,
+  "license": "MIT",
+  "author": "KataBedn",
+  "keywords": [
+    "llm-evaluation",
+    "llm-as-a-judge",
+    "promptfoo",
+    "prompt-injection",
+    "qa"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "eval": "promptfoo eval -c config/promptfooconfig.yaml --no-cache -o promptfoo_output.json",
+    "view": "promptfoo view",
+    "report": "python3 scripts/parse_perf_metrics.py",
+    "test": "python3 -m pytest"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "devDependencies": {
     "promptfoo": "^0.124.0"
   }
