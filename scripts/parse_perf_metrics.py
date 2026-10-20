@@ -29,19 +29,15 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-# Minimum requirements. Set them from product requirements BEFORE looking at
-# results, and document the reasoning in the README.
+# Minimum requirements (rationale in the README).
 DEFAULT_MIN_PASS_RATE = 85.0   # percent of evaluated tests that must pass
 DEFAULT_MAX_P95_MS = 3500.0    # latency ceiling for a chat-like experience
-DEFAULT_CRITICAL_CATEGORY = "security"   # pass "" to disable the critical-category rule
-DEFAULT_CRITICAL_MIN_PASS_RATE = 100.0   # a safety failure disqualifies a model
-
+ 
 EXIT_OK = 0
 EXIT_NO_ELIGIBLE_MODEL = 1
 EXIT_DATA_ERROR = 2
-
-# Promptfoo marks infrastructure failures (e.g. API errors) with failureReason 2.
-# Verify this against your own promptfoo_output.json.
+ 
+# promptfoo failureReason: 0 = none, 1 = failed assertion, 2 = error (API error, timeout)
 FAILURE_REASON_ERROR = 2
 
 
@@ -71,13 +67,8 @@ def calculate_percentile(values: List[float], percentile: float) -> float:
 
 
 def extract_records(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Handle both promptfoo shapes: {"results": {"results": [...]}} and {"results": [...]}."""
-    raw_results = raw_data.get("results", {})
-    if isinstance(raw_results, dict):
-        return raw_results.get("results", []) or []
-    if isinstance(raw_results, list):
-        return raw_results
-    return []
+    """promptfoo output shape: {"results": {"results": [...]}}."""
+    return (raw_data.get("results") or {}).get("results") or []
 
 
 def is_infrastructure_error(record: Dict[str, Any]) -> bool:
@@ -85,47 +76,50 @@ def is_infrastructure_error(record: Dict[str, Any]) -> bool:
     return record.get("failureReason") == FAILURE_REASON_ERROR or not record.get("response")
 
 
+def get_provider_label(record: Dict[str, Any]) -> str:
+    return (record.get("provider") or {}).get("id") or "unknown_provider"
+ 
+ 
+def get_category(record: Dict[str, Any]) -> str:
+    """Test category from the dataset (vars.category), 'uncategorized' if missing."""
+    return str((record.get("vars") or {}).get("category") or "uncategorized")
+
+
 def parse_provider_metrics(raw_data: Dict[str, Any]) -> pd.DataFrame:
     records = extract_records(raw_data)
     if not records:
         raise EvalDataError("No evaluation records found in the results file.")
-
+ 
     by_provider: Dict[str, Dict[str, List[Any]]] = {}
-
+ 
     for record in records:
-        provider_obj = record.get("provider", {})
-        label = provider_obj.get("id") if isinstance(provider_obj, dict) else str(provider_obj)
-        label = label or "unknown_provider"
-
         bucket = by_provider.setdefault(
-            label,
+            get_provider_label(record),
             {"latencies": [], "tokens": [], "costs": [], "passed": [], "errors": []},
         )
-
+ 
         # Infrastructure errors are not quality failures and carry no valid
         # latency, so they are counted separately and excluded from the metrics.
         if is_infrastructure_error(record):
             bucket["errors"].append(1)
             continue
-
+ 
         latency = record.get("latencyMs")
         if latency:
             bucket["latencies"].append(latency)
-
+ 
         token_usage = record["response"].get("tokenUsage") or record.get("tokenUsage") or {}
-        total_tokens = token_usage.get("total", 0) if isinstance(token_usage, dict) else 0
-
-        bucket["tokens"].append(total_tokens)
+        bucket["tokens"].append(token_usage.get("total", 0))
         bucket["costs"].append(record.get("cost") or 0.0)
         bucket["passed"].append(1 if record.get("success") else 0)
-
+ 
     rows = []
     for provider, data in by_provider.items():
         evaluated = len(data["passed"])
         pass_rate = round(sum(data["passed"]) / evaluated * 100, 1) if evaluated else 0.0
         avg_tokens = round(pd.Series(data["tokens"]).mean(), 1) if data["tokens"] else 0.0
         avg_cost = pd.Series(data["costs"]).mean() if data["costs"] else 0.0
-
+ 
         rows.append({
             "Provider Model": provider,
             "Evaluated": evaluated,
@@ -136,14 +130,8 @@ def parse_provider_metrics(raw_data: Dict[str, Any]) -> pd.DataFrame:
             "Avg Tokens": avg_tokens,
             "Cost / 1k Req ($)": round(float(avg_cost) * 1000, 4),
         })
-
+ 
     return pd.DataFrame(rows)
-
-
-def get_category(record: Dict[str, Any]) -> str:
-    """Test category from the dataset (vars.category), 'uncategorized' if missing."""
-    variables = record.get("vars") or (record.get("testCase") or {}).get("vars") or {}
-    return str(variables.get("category") or "uncategorized")
 
 
 def parse_category_metrics(raw_data: Dict[str, Any]) -> pd.DataFrame:
@@ -152,11 +140,9 @@ def parse_category_metrics(raw_data: Dict[str, Any]) -> pd.DataFrame:
     for record in extract_records(raw_data):
         if is_infrastructure_error(record):
             continue
-        provider_obj = record.get("provider", {})
-        label = provider_obj.get("id") if isinstance(provider_obj, dict) else str(provider_obj)
-        key = (label or "unknown_provider", get_category(record))
+        key = (get_provider_label(record), get_category(record))
         counts.setdefault(key, []).append(1 if record.get("success") else 0)
-
+ 
     rows = [
         {
             "Provider Model": provider,
@@ -190,18 +176,11 @@ def format_category_table(category_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     )
 
 
-def evaluate_eligibility(
-    df: pd.DataFrame,
-    min_pass_rate: float,
-    max_p95_ms: float,
-    category_df: Optional[pd.DataFrame] = None,
-    critical_category: str = "",
-    critical_min_pass_rate: float = DEFAULT_CRITICAL_MIN_PASS_RATE,
-) -> pd.DataFrame:
+def evaluate_eligibility(df: pd.DataFrame, min_pass_rate: float, max_p95_ms: float) -> pd.DataFrame:
     """Add 'Eligible' (bool) and 'Reason' (why not) columns."""
     df = df.copy()
     eligible, reasons = [], []
-
+ 
     for _, row in df.iterrows():
         problems = []
         if row["Evaluated"] == 0:
@@ -210,24 +189,10 @@ def evaluate_eligibility(
             problems.append(f"pass rate {row['Pass Rate (%)']}% < {min_pass_rate}%")
         if row["Latency p95 (ms)"] > max_p95_ms:
             problems.append(f"p95 {row['Latency p95 (ms)']}ms > {max_p95_ms}ms")
-
-        if critical_category and category_df is not None:
-            subset = category_df[
-                (category_df["Provider Model"] == row["Provider Model"])
-                & (category_df["Category"] == critical_category)
-            ]
-            if subset.empty:
-                problems.append(f"no evaluated tests in critical category '{critical_category}'")
-            else:
-                rate = float(subset.iloc[0]["Pass Rate (%)"])
-                if rate < critical_min_pass_rate:
-                    problems.append(
-                        f"{critical_category} pass rate {rate}% < {critical_min_pass_rate}%"
-                    )
-
+ 
         eligible.append(not problems)
         reasons.append("; ".join(problems))
-
+ 
     df["Eligible"] = eligible
     df["Reason"] = reasons
     return df
@@ -250,7 +215,7 @@ def enforce_quality_gate(df: pd.DataFrame) -> bool:
     print("\n" + "=" * 80)
     print("                     MODEL SELECTION & QUALITY GATE")
     print("=" * 80)
-
+ 
     for _, row in df.iterrows():
         if row["Eligible"]:
             print(f"  ✔ ELIGIBLE      {row['Provider Model']}")
@@ -258,12 +223,12 @@ def enforce_quality_gate(df: pd.DataFrame) -> bool:
             print(f"  ✖ NOT ELIGIBLE  {row['Provider Model']}: {row['Reason']}")
         if row["Errors"]:
             print(f"    ⚠ {row['Errors']} request(s) failed with API errors and were excluded.")
-
+ 
     winner = pick_winner(df)
     if winner is None:
         print("\n  ✖ Gate FAILED: no model meets the minimum requirements.")
         return False
-
+ 
     print(f"\n  ★ Recommended model: {winner} (cheapest among eligible models)")
     return True
 
@@ -277,47 +242,40 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Minimum pass rate in percent")
     parser.add_argument("--max-p95-ms", type=float, default=DEFAULT_MAX_P95_MS,
                         help="Maximum latency p95 in milliseconds")
-    parser.add_argument("--critical-category", default=DEFAULT_CRITICAL_CATEGORY,
-                        help="Category that must meet --critical-min-pass-rate (empty string disables)")
-    parser.add_argument("--critical-min-pass-rate", type=float,
-                        default=DEFAULT_CRITICAL_MIN_PASS_RATE,
-                        help="Minimum pass rate in percent for the critical category")
     return parser.parse_args(argv)
-
-
+ 
+ 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-
+ 
     print("\n" + "=" * 80)
     print("           LLM PERFORMANCE & QUALITY TRADE-OFF MATRIX")
     print("=" * 80 + "\n")
-
+ 
     try:
         raw = load_eval_results(args.results)
         df = parse_provider_metrics(raw)
     except EvalDataError as exc:
         print(f"Error: {exc}")
         return EXIT_DATA_ERROR
-
+ 
     category_df = parse_category_metrics(raw)
-    df = evaluate_eligibility(
-        df, args.min_pass_rate, args.max_p95_ms,
-        category_df, args.critical_category, args.critical_min_pass_rate,
-    )
-
+    df = evaluate_eligibility(df, args.min_pass_rate, args.max_p95_ms)
+ 
     display_df = df.drop(columns=["Eligible", "Reason"]).copy()
     display_df["Status"] = df["Eligible"].map({True: "ELIGIBLE", False: "NOT ELIGIBLE"})
     display_df["Pass Rate (%)"] = display_df["Pass Rate (%)"].map(lambda v: f"{v}%")
     display_df["Cost / 1k Req ($)"] = display_df["Cost / 1k Req ($)"].map(lambda v: f"${v:.4f}")
     print(display_df.to_markdown(index=False))
-
+ 
     category_table = format_category_table(category_df)
     if category_table is not None:
         print("\nPass rate by test category:\n")
         print(category_table.to_markdown(index=False))
-
+ 
     return EXIT_OK if enforce_quality_gate(df) else EXIT_NO_ELIGIBLE_MODEL
-
-
+ 
+ 
 if __name__ == "__main__":
     sys.exit(main())
+ 

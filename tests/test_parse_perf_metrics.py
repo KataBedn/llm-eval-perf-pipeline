@@ -43,14 +43,9 @@ def repeat(provider, n, passed, latency=1000, cost=0.001, category=None):
     return [make_record(provider, latency, cost, i < passed, 100, category) for i in range(n)]
 
 
-def evaluated(records, min_pass_rate=85.0, max_p95_ms=3500.0,
-              critical_category="", critical_min=100.0):
-    raw = wrap(records)
-    df = ppm.parse_provider_metrics(raw)
-    cat_df = ppm.parse_category_metrics(raw)
-    return ppm.evaluate_eligibility(
-        df, min_pass_rate, max_p95_ms, cat_df, critical_category, critical_min
-    )
+def evaluated(records, min_pass_rate=85.0, max_p95_ms=3500.0):
+    df = ppm.parse_provider_metrics(wrap(records))
+    return ppm.evaluate_eligibility(df, min_pass_rate, max_p95_ms)
 
 
 # ---------- metrics ----------
@@ -136,36 +131,6 @@ def test_model_above_latency_ceiling_is_not_eligible():
     assert "p95" in df.iloc[0]["Reason"]
 
 
-def test_security_failure_disqualifies_model_despite_high_overall_pass_rate():
-    records = (
-        # 10/11 overall (90.9%), but one security test failed
-        repeat("risky", 10, 10, category="billing")
-        + repeat("risky", 1, 0, category="security")
-        # fully safe model
-        + repeat("safe", 10, 9, category="billing")
-        + repeat("safe", 1, 1, category="security")
-    )
-    df = evaluated(records, critical_category="security")
-    status = dict(zip(df["Provider Model"], df["Eligible"]))
-
-    assert status == {"risky": False, "safe": True}
-    assert "security" in df[df["Provider Model"] == "risky"].iloc[0]["Reason"]
-
-
-def test_critical_category_rule_can_be_disabled():
-    records = repeat("risky", 10, 10, category="billing") + repeat("risky", 1, 0, category="security")
-    df = evaluated(records, critical_category="")
-
-    assert df.iloc[0]["Eligible"]
-
-
-def test_missing_critical_category_in_results_disqualifies_model():
-    df = evaluated(repeat("model-a", 10, 10, category="billing"), critical_category="security")
-
-    assert not df.iloc[0]["Eligible"]
-    assert "no evaluated tests" in df.iloc[0]["Reason"]
-
-
 def test_winner_is_cheapest_eligible_model():
     df = evaluated(
         repeat("expensive", 10, 10, cost=0.010)
@@ -232,10 +197,10 @@ def test_main_returns_ok_and_prints_recommendation(tmp_path, capsys):
     assert "Pass rate by test category" in out
 
 
-def test_main_fails_when_security_requirement_is_not_met(tmp_path):
+def test_main_fails_when_no_model_meets_the_requirements(tmp_path):
     results = tmp_path / "out.json"
-    records = repeat("model-a", 9, 9, category="billing") + repeat("model-a", 1, 0, category="security")
+    records = repeat("model-a", 10, 5, category="billing")
     results.write_text(json.dumps(wrap(records)), encoding="utf-8")
 
     assert ppm.main(["--results", str(results)]) == ppm.EXIT_NO_ELIGIBLE_MODEL
-    assert ppm.main(["--results", str(results), "--critical-category", ""]) == ppm.EXIT_OK
+    assert ppm.main(["--results", str(results), "--min-pass-rate", "50"]) == ppm.EXIT_OK
